@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pdftotext \"D:\\\\md_files\\\\湖表\\\\puffin\\\\puffin论文\\\\2606.04196v1.pdf\" -)"
+    ]
+  }
+}
