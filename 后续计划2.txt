@@ -1,0 +1,14 @@
+  后续计划
+
+  功能：
+  - ScalarOperator::In / Between / BetweenExclusive 支持——当前 BTree scan 只处理单值谓词
+  - scalar_selectivity 精确估算——当前保守返回 1.0 或 0.5，选率不准确
+
+  架构清理：
+  - ScalarValue::Int64 → 加 Int32 变体，避免 int 字段 32→64 膨胀
+  - 删掉 KeyType 映射层——algorithm_details 用 tagged JSON 自描述，不需要额外类型字段
+  - metadata_ops.rs 里 ScalarExpression + ScalarOperator + ScalarValue import——改为统一走 ScalarSearchRequest
+
+  测试：
+  - C 测试覆盖 In / Between 多值谓词
+  - 和 iceberg-db 联合测试：SQL 建表 + C API 建索引 + SQL 查询验证

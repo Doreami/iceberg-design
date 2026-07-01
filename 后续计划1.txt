@@ -1,0 +1,25 @@
+● 逐个回：
+
+  1. key_type 冗余 — 你说得对
+
+  scalar_selectivity 能拿到 indexed_table → schema → field_id 对应的 Iceberg 类型。直接从 schema 推导类型比在 algorithm_details 里存一份更干净。现在这个 key_type 字段是多余的。
+
+  2. Int64 归一化 — 确实会膨胀
+
+  BTree 排序页里的 key 列是 Int64Array，即使用户表是 int（32-bit），写入 BTree 数据页也按 64-bit 存。1000 万行 int 键，BTree 索引比存 32-bit 多占 ~38MB。这是 ScalarValue 只有 Int64 没 Int32 导致的。
+
+  3. 为什么会有 Iceberg type → KeyType 的映射
+
+  这不是故意设计，是分层演进的后果：
+
+  Iceberg schema:  int, long, string, double, float, timestamp, date, decimal...
+                      ↓  Arrow 读出来
+  Arrow type:      Int32, Int64, Utf8, Float64, ...
+                      ↓  scalar_value_from_array() 转换
+  ScalarValue:     Int64, Utf8, Float64, Bool, Null, List   ← 只有 6 种
+                      ↓  scalar_key_type() 再映射
+  KeyType:         Int64(0), Utf8(1), Float64(2)            ← 只有 3 种，用于 BTree 二进制编码
+
+  ScalarValue 把 Iceberg 类型塌缩成更少的变体（int→Int64, long→Int64）。KeyType 进一步塌缩（Int64、Utf8、Float64 三种），因为 BTree 二进制 lookup 只需要区分"怎么比大小"。这是渐进式的简化，没有统一规划。
+
+  总结：这几个问题都是对的，但属于 BTree 插件的设计债，不在这次 selectivity fix 的范围。当前 fix 是修 reader 能正确解析已有的 Puffin 数据，不改格式是最小侵入。
