@@ -1,4 +1,4 @@
-# RowID 串讲文档
+# RowID 设计串讲
 
 > **文档目的**：串讲 RowID 特性的设计理念、核心数据结构、新增与修改的接口、执行流程与存储结构。
 > 
@@ -14,7 +14,7 @@
 | ----------------------------- | ----------------------------------------------------------- |
 | **RowID**（`_row_id`）          | 行的**逻辑 ID**，分配后终生不变（Compaction/UPDATE 都不变）                  |
 | **RowAddr**（`_file` + `_pos`） | 行的**物理地址** `(file_path, row_position)`，会随重写变化               |
-| **`_pos`**                    | 行在文件内的 0-based 行号（**删除过滤之后**才计数，只数存活行）                      |
+| **`_pos`**                    | 行在文件内的 0-based 行号（**删除过滤之后**计数，只计算存活行）                      |
 | **first_row_id**              | 一个 DataFile 首行的 RowID；文件内满足 `_row_id = first_row_id + _pos` |
 | **next-row-id**               | 表级全局游标：下一个可分配的 `_row_id`；分配后 `+= 新增行数`，只增不减                 |
 | **游标 (cursor)**               | 顺序分配 RowID 用的"下一个可用值"指针，分配后向前推进                             |
@@ -29,11 +29,11 @@
 
 ## 一、RowID 基础与设计动机
 
-> 本章 1.1–1.4 是 Iceberg RowID 的通用背景（整合自 `Apache Iceberg rowid.md` / `Apache Iceberg first rowid.md`）；1.5 起是本项目二级索引为什么依赖它。RowID 的**分配与读取机制**属于实现设计，见 §5.3 / §5.4。
+> 本章 1.1–1.4 是 Iceberg RowID 的通用背景；1.5 起是本项目二级索引为什么依赖它。
 
 ### 1.1 什么是 `_row_id`（Iceberg 行级血缘）
 
-`_row_id` 是 Iceberg 表的一个**元数据列**（`BIGINT`），给每一行分配一个**稳定、唯一的逻辑 ID**：理念上在整个生命周期内**永不改变**（update/merge/compaction等操作由引擎来支持继承旧 ID）。它由数据文件的 `first_row_id` 加行内偏移导出：`_row_id = first_row_id + row_position`。
+`_row_id` 是 Iceberg 表的一个**元数据列**（`BIGINT`），给每一行分配一个**稳定、唯一的逻辑 ID**：理念上在整个生命周期内**永不改变**。它由数据文件的 `first_row_id` 加行内偏移导出：`_row_id = first_row_id + row_position`。（update/merge/compaction等操作需要由引擎来支持继承旧 ID， 把_row_id写入物理列）
 
 它与 `_last_updated_sequence_number`（最后更新序列号）共同构成**行级血缘（Row Lineage）**：`_row_id` 回答"这是哪一行"，后者回答"这行最后在哪个快照被改"。典型价值：行级血缘/CDC 增量、合规审计（GDPR 删除确认）、精确行级 DML、**二级索引的稳定锚点**。
 
@@ -71,27 +71,34 @@ next-row-id（表级：下一个可用）
 
 ### 1.4 DML 下的 RowID 行为
 
-| 操作                       | 旧行 `_row_id`         | 新行 `_row_id`                 | 新快照 `firstRowId`                       |
-| ------------------------ | -------------------- | ---------------------------- | -------------------------------------- |
-| **INSERT**               | —                    | 从 `next-row-id` 连续分配         | = 本批起点                                 |
-| **DELETE**               | 不变（仅被 delete 文件标记删除） | 无新行                          | **null**（addedRows=0，operation=delete） |
-| **UPDATE**               | 不变（旧行标记删除）           | 默认分配**新 ID**；由引擎自行支持继承保留旧 ID | = 本批起点，旧 ID 由物理列保留                     |
-| **Compaction / rewrite** | —                    | **继承并保留原 `_row_id`**（写入物理列）  | = 本批起点，旧 ID 由物理列保留                     |
+DML从rowid不变的理念上需要有以下行为
 
-> Compaction/rewrite 必须把 `_row_id` 写进新文件的**物理列**→ 物理位置全变但 `_row_id` 不变，这是行级追踪与索引稳定性的基石。
+| 操作                       | 旧行 `_row_id`         | 新行 `_row_id`                        | 新快照 `firstRowId`                       |
+| ------------------------ | -------------------- | ----------------------------------- | -------------------------------------- |
+| **INSERT**               | —                    | 从 `next-row-id` 连续分配                | = 本批起点                                 |
+| **DELETE**               | 不变（仅被 delete 文件标记删除） | 无新行                                 | **null**（addedRows=0，operation=delete） |
+| **UPDATE**               | 不变（旧行标记删除）           | 默认分配**新 ID**；由引擎自行支持继承保留旧 ID        | = 本批起点，旧 ID 由物理列保留                     |
+| **Compaction / rewrite** | —                    | 默认分配**新 ID**；由引擎自行支持继承保留旧 ID（写入物理列） | = 本批起点，旧 ID 由物理列保留                     |
+
+> UPDATE/Compaction/rewrite操作会改变物理位置和first_row_id，导致动态通过first_row_id计算出来的_row_id不准确，所以需要把 `_row_id` 写进新文件的**物理列**→ 物理位置全变保持 `_row_id` 不变，这是行级追踪与索引稳定性的基石。
 > 
 > 继承不冻结游标：新文件**仍分配**文件级 `first_row_id`、`next-row-id` **仍推进**；继承靠读路径的物理列优先（shadow 掉计算值），而非跳过游标分配。这会导致文件中实际 `_row_id` **可能小于** 文件级 `first_row_id`（如继承来的旧 ID=5，新文件 first=11），属正常现象，读取以物理列为准。因此 **文件级 `first_row_id` 不可当作该文件的最小 RowID 来做剪枝**——`RowIdMapping` 按实际值构建，不依赖此假设。
 
 ### 1.5 为什么二级索引需要 RowID（设计动机）
 
-**旧架构痛点**：索引直接存 `RowAddress`（物理地址），与快照绑定。一旦 DELETE / Compaction 改变物理位置，索引整体失效，必须重建。
+**旧架构痛点**：索引直接存 `RowAddress`（物理地址），与快照绑定。一旦数据改变了物理位置，索引整体失效，必须重建。
 
 **RowID 架构的价值**：
 
-1. **Compaction 不失效** —— 数据重组后 RowID 不变，只需更新 `RowID → RowAddr` 映射表，**索引条目 0 改动**。
-2. **DELETE 精确清理** —— 见 §5.6。
+1. **表级映射，统一维护** —— 维护`RowIdMapping`映射表，记录`RowID → RowAddr`映射，`RowIdMapping` 是**表级别**的，被该表上所有索引共享。旧架构每个索引各自维护物理地址，N 个索引要维护 N 份；现在只需维护 1 份映射，更快更简单。
+
+2. **Compaction 不失效** —— 数据重组后 RowID 不变，只需更新 `RowIdMapping` 映射表，**索引条目 0 改动**。
+
 3. **UPDATE 可继承** —— 引擎把旧 RowID 写入更新后的行，则索引只需更新映射（见 §5.8 MOR/COW）。
-4. **回表定位解耦** —— 索引存 RowID，查询时 `RowID → 映射 → RowAddr → 读数据`，物理位置变化对上层透明。
+
+4. **DELETE 精确清理** —— SDK 的 delete 文件过滤已保证删除行不会被读到（索引层不用关心 delete 文件）。`prune` + `remove_row_ids` 的作用是**防止索引膨胀**：不清理的话已删 RowID 仍在索引和映射里，每次检索都白白做一轮查找和回表，虽不丢正确性但浪费 IO。RowID 能精确定位这些无效条目，零伤及无辜。（见 §5.6）
+
+5. **避免全量重建** —— DELETE / Compaction / UPDATE 不再要求索引整体重建：DELETE 只 `prune` 对应条目，Compaction 只更新映射（索引不动），UPDATE 继承旧 ID 后索引可完全不变。对比旧架构"任何物理变更 → 索引失效 → 全量重建"，RowID 把维护代价从 O(全表) 降到了 O(增量)。
 
 ---
 
@@ -101,45 +108,46 @@ RowID 增强的二级索引围绕一个核心思想：**索引只存稳定的逻
 
 ```
 索引存：(索引键 → RowID)   ← 稳定逻辑 ID，不含物理地址
-映射存：RowID → (file_path, row_position)   ← 物理地址，会随重写变化
+映射存：RowID → RowAddress(file_path, row_position)   ← 物理地址，会随重写变化
 ```
 
-### 2.1 检索链路
-
-```
-index.search(query) → RowID[]
-  → RowIdMapping.lookup_batch(RowID[]) → RowAddress[]
-    → reader.read_file_rows(RowAddress[]) → RecordBatch
-```
-
-索引构建时，插件逐行提取 `(索引键, RowID)` 写入索引段；检索时，查索引得候选 RowID 列表 → 经 `RowIdMapping` 批量解析为物理地址 → 回表读数据行。插件只认识 RowID，从不接触物理地址。
-
-### 2.2 DML 下的稳定性
-
-RowID 在行生命周期内保持不变，DML 只影响映射层，索引条目不动：
-
-| 操作             | RowID       | 映射层                                       | 索引条目                   |
-| -------------- | ----------- | ----------------------------------------- | ---------------------- |
-| **INSERT**     | 新分配         | 追加新 FileMapping                           | 追加新条目                  |
-| **DELETE**     | 不变          | `remove_row_ids()` 移除                     | `prune()` 按 RowID 精确删除 |
-| **UPDATE**（继承） | 保留旧 ID（物理列） | `rebuild_after_compaction()` 换地址（即 remap） | 0 改动                   |
-| **Compaction** | 不变          | `rebuild_after_compaction()` 换地址（即 remap） | 0 改动                   |
-
-> **DELETE 精确清理的含义**：插件存的是 `索引键 → RowID`（如 `name="Tom" → [5, 9]`）。DELETE rowid=5 后若不清，检索 `"Tom"` 仍返回 5 → 回表已不存在 → 脏结果。因 RowID 稳定，可精确定位并删除该条目（`prune` + `remove_row_ids`），无需整段重建。
-
-### 2.3 RowID 的分配
+### 2.1 RowID 的分配
 
 表级全局游标 `next-row-id`（存 `metadata.json`）指向"下一个可分配的 `_row_id`"。写入时，每个数据文件取当前 `next-row-id` 作为自己的 `first_row_id`，文件内每行 `_row_id = first_row_id + row_position`（row_position 为文件内 0-based 偏移）。写完后 `next-row-id += 本批新增行数`。
 
-INSERT 产生的新文件 RowID 连续 → `RowIdMapping` 用 `Range(first, count)` 编码，仅 16 字节。Compaction 合并多文件后 RowID 不连续 → 自动切换 `SortedArray` 编码。DELETE 稀疏化后 → `RangeWithBitmap` 位图标记存活行。详见 §2.5 映射编码。
-
-### 2.4 RowID 的读取（双读）
+### 2.2 RowID 的读取（双读）
 
 读路径**物理列优先**：若 Parquet 文件含物理 `_row_id` 列（Compaction / UPDATE-COW 重写时保留的旧 ID），直接读物理值；否则动态计算 `first_row_id + row_position`。
 
 双读的意义：Compaction 后文件被重写，新文件的 `first_row_id` 是游标新分配的，但行保留的旧 `_row_id` 存在物理列里。若没有物理列优先，`first_row_id + position` 会算出错误的新值，行级追踪断裂。继承带来的副作用是文件中实际 `_row_id` 可能小于文件级 `first_row_id`（继承旧 ID=5，新文件 first=11），属正常现象，读取以物理列为准。
 
-### 2.5 映射的编码策略
+> **动态计算的局限**：MOR DELETE 后，`_pos` 跳过已删行重新编号 → 被删行之后的行 `_row_id` 前移。纯动态计算的 `_row_id` 只在快照内稳定；跨快照行级血缘必须依赖 Compaction 写入的物理列兜底。
+
+### 2.3 RowIdMapping 映射表
+
+`RowIdMapping` 是**表级别**的 `RowID → RowAddress` 映射表，被该表上所有索引共享。它是 RowID 架构的**中心枢纽**——索引只存 `(键 → RowID)`，物理地址全部托管给映射表。
+
+**结构**：一个按 `min_row_id` 升序排列的 `FileMapping` 列表，每个 `FileMapping` 对应一个数据文件，记录 `(file_path, row_ids 编码)`。对外接口：
+
+| 方法                          | 用途                      | 复杂度                |
+| --------------------------- | ----------------------- | ------------------ |
+| `lookup(row_id)`            | 单个 RowID → RowAddress   | O(log M + log N)   |
+| `lookup_batch(row_ids)`     | 批量解析，先排序后单次扫描           | O(K log K + K + M) |
+| `remove(row_ids)`           | DELETE 后移除已删 RowID      | O(K log N)         |
+| `rebuild(files)`            | Compaction 后整体重建        | O(总行数)             |
+| `to_blob()` / `from_blob()` | 序列化到 Puffin blob / 反序列化 | O(总行数)             |
+
+**生命周期**：
+
+```
+INSERT → 追加 FileMapping（Range 编码，16 字节）
+DELETE → remove() 在位图中清位，或降级为 SortedArray
+Compaction → rebuild() 用新文件路径重建整个映射
+```
+
+**为什么高效**：N 个索引共享 1 份映射，Compaction 后只需更新这 1 份（O(文件数)），而不是重建 N 个索引（O(N × 全表)）。详见 §3.2 结构体定义、§6.3 blob 编码。
+
+### 2.4 映射的编码策略
 
 `RowIdMapping` 按文件粒度自动选择最紧凑的编码：
 
@@ -151,7 +159,64 @@ INSERT 产生的新文件 RowID 连续 → `RowIdMapping` 用 `Range(first, coun
 
 `lookup(row_id)` 先按 `min_row_id` 二分定位到文件（O(log M)），再按文件编码取值。映射整体典型 <10MB（M=1000 文件、Range 为主）。
 
-### 2.6 两层分工与调用入口
+**编码切换不只是空间优化，更是 DELETE 后 `position_of` 正确性的保证**：
+
+回表需要根据`rowid`计算出`_pos`，`_pos`在定义中只计算存活的行 → 被删行之后的行位置前移。
+
+举个例子：如果有`1,X,X,4` 4行数据，且中间两行被删除，那么rowid等于4的这一行`_pos`等于2
+
+因此 DELETE 触发编码迁移：`Range` → `RangeWithBitmap` 或 `SortedArray`。新编码的 `position_of` 只计数存活行：
+
+| 编码                | `position_of` 实现                              | 是否跳过已删行                |
+| ----------------- | --------------------------------------------- | ---------------------- |
+| `Range`           | `row_id - first`                              | ❌ 不跳（但 Range 只用于无删除场景） |
+| `RangeWithBitmap` | `popcount(bitmap[0..offset])` — 数目标位之前有多少个存活行 | ✅                      |
+| `SortedArray`     | `ids.binary_search(row_id)` — 数组只含存活行，索引即位置   | ✅                      |
+
+后两种编码的 `position_of` 返回值与 `_pos` 过滤后的行号天然一致，`RowAddress.row_position` 始终准确。
+
+### 2.5 构建链路
+
+```
+source.scan_data_files(snapshot) → (col_values, RowID)[]
+  → plugin.build((col_values, RowID)[]) → segment.puffin
+```
+
+构建时，SDK 扫描数据文件产出 `(列值, RowID)` 流，插件逐行提取索引键写入索引段。详见 §5.1（首次全量）、§5.5（INSERT 增量维护）。
+
+### 2.6 检索链路
+
+```
+index.search(query) → RowID[]
+  → RowIdMapping.lookup_batch(RowID[]) → RowAddress[]
+    → reader.read_file_rows(RowAddress[]) → RecordBatch
+```
+
+检索时，查索引得候选 RowID 列表 → 经 `RowIdMapping` 批量解析为物理地址 → 回表读数据行。插件只认识 RowID，从不接触物理地址。详见 §5.2。
+
+### 2.7 DML 下的稳定性与维护
+
+RowID 在行生命周期内保持不变，DML 只影响映射层，索引条目不动：
+
+| 操作             | RowID       | RowIdMapping映射层                            | 索引条目                   |
+| -------------- | ----------- | ------------------------------------------ | ---------------------- |
+| **INSERT**     | 新分配         | 追加新 FileMapping                            | 追加新条目                  |
+| **DELETE**     | 不变          | `remove_row_ids()` 移除                      | `prune()` 按 RowID 精确删除 |
+| **UPDATE**（继承） | 保留旧 ID（物理列） | `rebuild_after_compaction()` 换地址（即remap操作） | 0 改动                   |
+| **Compaction** | 不变          | `rebuild_after_compaction()` 换地址（即remap操作） | 0 改动                   |
+
+**DELETE 精确清理的含义**：SDK 的 delete 文件过滤已确保已删行永不被读到（索引层不感知）。清理的目的是**性能而非正确性**——不 `prune` 不会出错，但索引和映射里堆积的已删 RowID 会导致每次检索都白做无效查找。因 RowID 稳定，可精确定位并删除这些条目（`prune` + `remove_row_ids`），无需整段重建。
+
+**UPDATE：**
+
+- COW：旧文件整个删掉，新文件写入更新后的行（RowID 继承到物理列）
+- MOR：旧行被 delete 文件标记，新行写入新文件（RowID 继承到物理列）
+
+和 **Compaction** 本质是同一件事——"文件轮转，RowID 保留"，所以走同一个 rebuild_after_compaction() 接口。
+
+**原子性要求**：`prune`（清索引条目）和 `remove_row_ids`（切映射编码）必须与 DELETE 在**同一个快照内原子提交**。若 prune 先完成而 `remove_row_ids` 未提交，此时查询存活行会走到旧 `Range` 编码 → `position_of` 不跳已删行 → `row_position` 偏移 → 回表读到错误行。当前引擎需手动串联这三者，端到端原子性尚未接通（见 §8.1）。
+
+### 2.8 两层分工与调用入口
 
 引擎经 **ABI（`iceberg-index-abi`）→ `IndexedTableView::open_metadata_location(...)`→ `search_*` / `prepare_*_index(...)`** 访问，写操作返回 `StatisticsFile` 由 bridge 原子提交。检索链路在 `search_*` 内闭环。
 
@@ -162,9 +227,143 @@ INSERT 产生的新文件 RowID 连续 → `RowIdMapping` 用 `Range(first, coun
 
 ---
 
-## 三、新增 / 修改的接口
+## 三、关键结构体
 
-> 能力概览（设计见 §二，详细签名见下表）。
+### 3.1 SDK 层结构体
+
+#### `FileScanTask.first_row_id` —— 扫描任务上的行血缘种子
+
+```rust
+pub struct FileScanTask {
+    // ... 既有字段 ... 
+    pub first_row_id: Option<u64>,
+}
+```
+
+由 `scan/context.rs` 从 `manifest_entry.data_file().first_row_id()` 自动填充，读取管线据此动态计算 `_row_id`。
+
+> 注：`_file` / `_pos` / `_row_id` 在 SDK 侧是**列（保留 field ID + 列名常量）**
+
+### 3.2 Index 层结构体（**核心**）
+
+#### `RowAddress` —— 物理行地址
+
+```rust
+pub struct RowAddress {
+    pub file_path: String,
+    pub row_position: u64,
+}
+```
+
+回表读取的入参：检索协调器经 `RowIdMapping::lookup(&self, row_id: u64)` 把 RowID 解析为此结构体。插件不直接产出物理地址 —— 向量插件返回 `ScoredRowId { row_id, score }`，标量插件返回 `Vec<u64>`。
+
+> 向量插件（IVF / IVF-PQ）的 score 是 查询向量与候选向量的平方 L2 距离（squared Euclidean distance）。搜索时按 score 升序排列，score 相同则按 RowID 升序保证确定性排序。
+
+#### `RowIdEncoding` —— 单文件内 RowID 序列的三态编码
+
+```rust
+pub enum RowIdEncoding {
+    Range { first: u64, count: u64 },                       // 连续递增，16 字节
+    RangeWithBitmap { first: u64, count: u64, bitmap: Vec<u8> }, // 稀疏 DELETE (≤50%)，16B+N/8B
+    SortedArray { ids: Vec<u64> },                           // 非连续，N×8 字节
+}
+```
+
+**自动选择策略**：连续 → `Range`；DELETE ≤50% → `RangeWithBitmap`；非连续/删除 >50% → `SortedArray`。进一步删除时 `RangeWithBitmap` 清位；剩余行重新连续时自动压回 `Range`。
+
+> **命名歧义**：`Range { first }` 是映射中该文件**实际 RowID 的最小值**（`min_row_id()`），与 manifest 元数据的文件级 `first_row_id` 不是同一个概念。INSERT 直出文件两者碰巧相等，Compaction 继承后实际值可能远小于元数据值（继承旧 ID=5，新文件 first=11）。映射全部基于实际值构建和排序，不依赖文件元数据。
+
+> **物理存储怎么区分是哪一种编码？** 序列化时每个文件的 payload 前有 **1 字节 `encoding` tag**：`0=Range`、`1=SortedArray`、`2=RangeWithBitmap`。反序列化按 tag 分派。完整字节布局见 **§6.3**。
+
+#### `FileMapping` —— 单个 DataFile 的映射条目
+
+```rust
+pub struct FileMapping {
+    pub file_path: String,
+    pub row_ids: RowIdEncoding,
+}
+```
+
+#### `RowIdMapping` —— 全局 RowID → RowAddr 映射表
+
+**RowID 特性的基石**
+
+```rust
+pub struct RowIdMapping {
+    files: Vec<FileMapping>,   // 私有，按 min_row_id 升序排列
+}
+```
+
+> **为什么只有一个字段？** 它本质就是"一批按 `min_row_id` 排序的 `FileMapping`"。排序保证跨文件可二分（`lookup` O(log M)），文件内再按编码二分/直算。`files` 私有，对外通过 `file_count()` / `total_rows()` / `iter()` / `lookup*()` 访问。持久化到 Puffin blob（类型 `huawei.gauss-infra.rowid-mapping-v1`）。
+
+**RowID → RowAddress 解析机制**：
+
+1. **跨文件定位**：`files` 按 `min_row_id` 升序排列，二分找到包含目标 RowID 的文件（O(log M)）；`lookup_batch` 则先对输入 RowID 排序，文件指针只前进不后退（均摊 O(1) 跨文件查找）。
+
+2. **文件内定位**：调用 `FileMapping::position_of(row_id)`，按编码类型分派：
+   
+   - `Range`：`row_id - first`（O(1)）
+   
+   - `SortedArray`：`ids.binary_search(&row_id)`（O(log N)）
+   
+   - `RangeWithBitmap`：先验证 `row_id - first` 落在范围内，再检查 bitmap 该位是否为 1（存活）（O(1)）
+
+3. **输出**：`position_of` 返回文件内的 0-based 行位置，组装 `RowAddress { file_path, row_position }`。
+
+#### `ScoredRowId` —— 插件返回的"地址无关"查询结果
+
+```rust
+// ...
+pub struct ScoredRowId {
+    pub row_id: u64,
+    pub score: f32,
+}
+```
+
+> **关键设计**：插件构建/检索时只认识稳定 RowID。向量插件返回 `ScoredRowId`（含 row_id + score），标量插件返回 `Vec<u64>`，由 table 层统一经 `RowIdMapping` 解析成 `RowAddress`。
+
+#### `IndexSegmentMetadata` —— 索引段元数据
+
+```rust
+// iceberg-index-core/src/model.rs（节选）
+pub struct IndexSegmentMetadata {
+    pub segment_id: SegmentId,                              // ← 既有
+    pub built_at_snapshot_id: SnapshotId,                   // ← 既有
+    pub covered_data_files: BTreeSet<String>,               // ← 既有
+    pub artifact_files: Vec<ArtifactFile>,                  // ← 既有：段实体文件的 URI 指针
+    pub indexed_rows: u64,                                   // ← 既有
+    /// 【本次 RowID/COW 相关新增】每覆盖文件的行数。
+    pub covered_data_file_rows: Option<BTreeMap<String, u64>>,
+    // ... algorithm_details / format_version / created_at_ms 等既有字段 ...
+}
+```
+
+- **作用**：`covered_data_file_rows` 的 key 是文件路径，value 是该文件中的行数。构建时记录每文件有多少行，检索时用来算死行占比。没有这个字段时，段只能在其覆盖的所有文件**全部存活**时才复用。有了它，即使部分行被删，只要死行占比低于阈值（`CoveragePolicy.max_dead_row_ratio 50%`），就可以**部分复用**——从旧段查出候选 RowID（含已删行的），经 `RowIdMapping` 过滤掉死行后回表，避免整段重建。
+
+#### `SnapshotChange` / `CompactionDiff` / `MaintenanceAction` —— DML 维护三件套
+
+```rust
+pub enum SnapshotChange { AppendOnly, DeleteOnly, Compaction, FullRewrite, NoChange }
+
+pub struct CompactionDiff {
+    pub removed_files: HashSet<String>,
+    pub added_files: Vec<DataFileRef>,
+}
+
+pub enum MaintenanceAction { NoOp, AppendOnly, DeleteOnly, Compaction, FullRebuild }
+```
+
+三者协同流程（详见 §5.5–5.9，其中 §5.9 含 SnapshotChange → 映射接口的对应表）：
+
+1. `classify_change(old, new)` 判断这是什么操作：纯追加(`AppendOnly`)、纯删除(`DeleteOnly`)、Compaction、全量重写(`FullRewrite`)或无变化(`NoChange`)。
+2. 若为 `Compaction`，`detect_compaction(old, new)` 返回 `CompactionDiff { removed_files, added_files }`，喂给 `rebuild_after_compaction()`。
+3. 按结果选策略，转成 `MaintenanceAction` 传入 `maintain_index()`：`AppendOnly`→增量构建、`DeleteOnly`→清理、`Compaction`/`FullRewrite`→remap、`NoOp`→直接复用旧条目。
+
+---
+
+## 四、新增 / 修改的接口
+
+> 能力概览（设计见 §二，详细签名见后续签名）。
 
 | 层     | 能力                         | 接口                                                                          | 新增/修改 | 引擎需主动调用 |
 | ----- | -------------------------- | --------------------------------------------------------------------------- |:-----:|:-------:|
@@ -181,7 +380,7 @@ INSERT 产生的新文件 RowID 连续 → `RowIdMapping` 用 `Range(first, coun
 | Index | INSERT 增量                  | `plan_incremental(from, to, field_ids)` + `maintain_index(AppendOnly, ...)` | 新增    | ✅       |
 | Index | 维护分发                       | `maintain_index(action: MaintenanceAction, request, previous_registry)`     | 新增    | ✅       |
 
-### 3.1 SDK 层（`iceberg-rust`）
+### 4.1 SDK 层（`iceberg-rust`）
 
 #### (A) 元数据 / 写入路径
 
@@ -217,7 +416,7 @@ INSERT 产生的新文件 RowID 连续 → `RowIdMapping` 用 `Range(first, coun
 
 > **用法**：`select(["col_a", "_row_id", "_pos"])` — 元数据列 opt-in，传列名即可。`select_all()` 只投影数据列，默认不带 `_row_id` / `_pos`。不想读则不传该列名。
 
-### 3.2 Index 层（`iceberg-index`）
+### 4.2 Index 层（`iceberg-index`）
 
 #### (A) RowID 映射核心 —— `RowIdMapping`（`iceberg-index-core`）
 
@@ -288,144 +487,6 @@ let batch = view.search_scalar_materialized("my_btree_index", scalar_query).awai
 
 ---
 
-## 四、关键结构体
-
-### 4.1 SDK 层结构体
-
-#### `FileScanTask.first_row_id` —— 扫描任务上的行血缘种子
-
-```rust
-// ...
-pub struct FileScanTask {
-    // ... 既有字段 ... 
-    pub first_row_id: Option<u64>,
-}
-```
-
-由 `scan/context.rs` 从 `manifest_entry.data_file().first_row_id()` 自动填充，读取管线据此计算 `_row_id`。
-
-> 注：`_file` / `_pos` / `_row_id` 在 SDK 侧是**列（保留 field ID + 列名常量）**，不是独立结构体；物理地址结构体 `RowAddress` 属于 **Index 层**（见 4.2），SDK 本身没有 `RowAddress` 类型。
-
-### 4.2 Index 层结构体（**核心**）
-
-#### `RowAddress` —— 物理行地址（**Index 层结构体**）
-
-```rust
-// ...
-pub struct RowAddress {
-    pub file_path: String,
-    pub row_position: u64,
-}
-```
-
-回表读取的入参：检索协调器经 `RowIdMapping::lookup(&self, row_id: u64)` 把 RowID 解析为此结构体。插件不直接产出物理地址 —— 向量插件返回 `ScoredRowId { row_id, score }`，标量插件返回 `Vec<u64>`。
-
-#### `RowIdEncoding` —— 单文件内 RowID 序列的三态编码
-
-```rust
-// ...
-pub enum RowIdEncoding {
-    Range { first: u64, count: u64 },                       // 连续递增，16 字节
-    RangeWithBitmap { first: u64, count: u64, bitmap: Vec<u8> }, // 稀疏 DELETE (≤50%)，16B+N/8B
-    SortedArray { ids: Vec<u64> },                           // 非连续，N×8 字节
-}
-```
-
-**自动选择策略**：连续 → `Range`；DELETE ≤50% → `RangeWithBitmap`；非连续/删除 >50% → `SortedArray`。进一步删除时 `RangeWithBitmap` 清位；剩余行重新连续时自动压回 `Range`。
-
-> **命名歧义**：`Range { first }` 是映射中该文件**实际 RowID 的最小值**（`min_row_id()`），与 manifest 元数据的文件级 `first_row_id` 不是同一个概念。INSERT 直出文件两者碰巧相等，Compaction 继承后实际值可能远小于元数据值（继承旧 ID=5，新文件 first=11）。映射全部基于实际值构建和排序，不依赖文件元数据。
-
-> **物理存储怎么区分是哪一种编码？** 序列化时每个文件的 payload 前有 **1 字节 `encoding` tag**：`0=Range`、`1=SortedArray`、`2=RangeWithBitmap`。反序列化按 tag 分派。完整字节布局见 **§6.3**。
-
-#### `FileMapping` —— 单个 DataFile 的映射条目
-
-```rust
-// ...
-pub struct FileMapping {
-    pub file_path: String,
-    pub row_ids: RowIdEncoding,
-}
-```
-
-#### `RowIdMapping` —— 全局 RowID → RowAddr 映射表（**RowID 特性的基石**）
-
-```rust
-// ...
-pub struct RowIdMapping {
-    files: Vec<FileMapping>,   // 私有，按 min_row_id 升序排列
-}
-```
-
-> **为什么只有一个字段？** 它本质就是"一批按 `min_row_id` 排序的 `FileMapping`"。排序保证跨文件可二分（`lookup` O(log M)），文件内再按编码二分/直算。`files` 私有，对外通过 `file_count()` / `total_rows()` / `iter()` / `lookup*()` 访问。持久化到 Puffin blob（类型 `huawei.gauss-infra.rowid-mapping-v1`）。
-
-**RowID → RowAddress 解析机制**：
-
-1. **跨文件定位**：`files` 按 `min_row_id` 升序排列，二分找到包含目标 RowID 的文件（O(log M)）；`lookup_batch` 则先对输入 RowID 排序，文件指针只前进不后退（均摊 O(1) 跨文件查找）。
-
-2. **文件内定位**：调用 `FileMapping::position_of(row_id)`，按编码类型分派：
-   
-   - `Range`：`row_id - first`（O(1)）
-   
-   - `SortedArray`：`ids.binary_search(&row_id)`（O(log N)）
-   
-   - `RangeWithBitmap`：先验证 `row_id - first` 落在范围内，再检查 bitmap 该位是否为 1（存活）（O(1)）
-
-3. **输出**：`position_of` 返回文件内的 0-based 行位置，组装 `RowAddress { file_path, row_position }`。
-
-#### `ScoredRowId` —— 插件返回的"地址无关"查询结果
-
-```rust
-// ...
-pub struct ScoredRowId {
-    pub row_id: u64,
-    pub score: f32,
-}
-```
-
-> **关键设计**：插件构建/检索时只认识稳定 RowID。向量插件返回 `ScoredRowId`（含 row_id + score），标量插件返回 `Vec<u64>`，由 table 层统一经 `RowIdMapping` 解析成 `RowAddress`。
-
-#### `IndexSegmentMetadata` —— 索引段元数据
-
-```rust
-// iceberg-index-core/src/model.rs（节选）
-pub struct IndexSegmentMetadata {
-    pub segment_id: SegmentId,                              // ← 既有
-    pub built_at_snapshot_id: SnapshotId,                   // ← 既有
-    pub covered_data_files: BTreeSet<String>,               // ← 既有
-    pub artifact_files: Vec<ArtifactFile>,                  // ← 既有：段实体文件的 URI 指针
-    pub indexed_rows: u64,                                   // ← 既有
-    /// 【本次 RowID/COW 相关新增】每覆盖文件的行数。
-    pub covered_data_file_rows: Option<BTreeMap<String, u64>>,
-    // ... algorithm_details / format_version / created_at_ms 等既有字段 ...
-}
-```
-
-- **作用**：`covered_data_file_rows` 的 key 是文件路径，value 是该文件中的行数。构建时记录每文件有多少行，检索时用来算死行占比。没有这个字段时，段只能在其覆盖的所有文件**全部存活**时才复用。有了它，即使部分行被删，只要死行占比低于阈值（`CoveragePolicy.max_dead_row_ratio`），就可以**部分复用**——从旧段查出候选 RowID（含已删行的），经 `RowIdMapping` 过滤掉死行后回表，避免整段重建。
-
-#### `SnapshotChange` / `CompactionDiff` / `MaintenanceAction` —— DML 维护三件套
-
-```rust
-// ...
-pub enum SnapshotChange { AppendOnly, DeleteOnly, Compaction, FullRewrite, NoChange }
-
-// ...
-pub struct CompactionDiff {
-    pub removed_files: HashSet<String>,
-    pub added_files: Vec<DataFileRef>,
-}
-
-// ...
-pub enum MaintenanceAction { NoOp, AppendOnly, DeleteOnly, Compaction, FullRebuild }
-```
-
-三者协同流程（详见 §5.5–5.9）：
-
-1. `detect_compaction(old, new)` 先判断是否 Compaction，若同时有文件增删则返回 `CompactionDiff { removed_files, added_files }`，喂给 `rebuild_after_compaction()`。
-2. `classify_change(old, new)` 判断这是什么操作：纯追加(`AppendOnly`)、纯删除(`DeleteOnly`)、Compaction、全量重写(`FullRewrite`)或无变化(`NoChange`)。
-3. 按结果选策略，转成 `MaintenanceAction` 传入 `maintain_index()`：`AppendOnly`→增量构建、`DeleteOnly`→清理、`Compaction`/`FullRewrite`→remap、`NoOp`→直接复用旧条目。
-
----
-
 ## 五、执行流程（端到端）
 
 > 每个流程标注穿越的层与关键函数。
@@ -444,7 +505,7 @@ pub enum MaintenanceAction { NoOp, AppendOnly, DeleteOnly, Compaction, FullRebui
   │     └─▶ [框架] build_rowid_mapping(snapshot)
   │           └─ 收集 (file_path, row_id) → RowIdMapping::build()
   │              新文件 RowID 连续 → Range 编码（16B/文件）
-  └─▶ 提交：注册表 blob 写进 registry Puffin，作为 StatisticsFile 原子挂到快照（见 §5.9、§6.1）。映射 blob 随注册表一并持久化为设计目标，当前状态见 §8.1
+  └─▶ 提交：注册表 blob 写进 registry Puffin，作为 StatisticsFile 原子挂到快照（见 §5.9、§6.1）。映射 blob 随注册表一并持久化
   返回 IndexRegistryEntry
 ```
 
@@ -502,7 +563,7 @@ classify_change(old, new) → AppendOnly
 
 ### 5.6 DELETE 清理
 
-**为什么要清理**：插件存的是 `索引键值 → RowID`（如 `name="Tom" → [5, 9]`）。DELETE 掉 rowid=5 后若不清理，检索 `"Tom"` 仍返回 `[5, 9]`，回表 rowid=5 已不存在 → 脏结果。因 RowID 稳定，可**精确**删掉这几条而无需整段重建。
+**为什么要清理**：SDK 的 delete 文件过滤已保证删除行不会被读取——即使索引返回了已删 RowID，回表时 SDK 也会过滤掉，结果正确。但索引条目和映射里堆积无效 RowID 会导致每次检索都白跑查找（映射解析 → 回表 → 空结果），空间和时间都浪费。因 RowID 稳定，可**精确**定位并删掉这几条而无需整段重建。
 
 ```
 classify_change(old, new) → DeleteOnly
@@ -645,7 +706,7 @@ Puffin 是**写一次的不可变文件**：`Magic "PFA1"` → 各 blob 字节�
 file_count : u32 LE
 每个 FileMapping 重复：
   path_len : u32 LE     path : UTF-8 bytes
-  encoding : u8         ★0=Range  1=SortedArray  2=RangeWithBitmap
+  encoding : u8         0=Range  1=SortedArray  2=RangeWithBitmap
   ── encoding=0 ──  first : u64 LE   count : u64 LE           （16B）
   ── encoding=2 ──  first : u64 LE   count : u64 LE
                      bmp_len : u32 LE   bitmap : u8×bmp_len   （16B+4B+N/8）
@@ -657,19 +718,36 @@ file_count : u32 LE
 ### 6.4 读写接口
 
 - 写：`write_registry_statistics_file`→映射 blob 与注册表同写一个 registry Puffin，`prepare_*_index` 返回 `StatisticsFile` 交 bridge 提交。
-- 读：`load_mapping_from_source()` → `from_blob()`；blob 缺失→`build_rowid_mapping` 从数据重建，最坏空映射。
-- 入口：`IndexedTableView::open_metadata_location()` 自动完成上述加载。
+- 读：`load_mapping_from_source()` → `from_blob()`；如果blob 缺失→`build_rowid_mapping` 从数据重建，最坏空映射。
+- ABI入口：`IndexedTableView::open_metadata_location()` 自动完成上述加载。
 
 ---
 
 ## 七、关键设计约束
 
 1. **插件不 remap** —— `IndexPlugin::remap()` 已移除。Remap 统一由框架层 `RowIdMapping::rebuild_after_compaction()` 完成，Compaction 只换映射物理地址，索引条目 0 改动。
+
 2. **i64/u64 边界** —— `RowIdMapping` 用 `u64`；插件存 `i64`(BTree) 或 `u64`(IVF)，`as` 转换，小端零开销。
+   
+   **为什么有两套类型**：
+   
+   | 组件              | 类型                          | 原因                                                                            |
+   | --------------- | --------------------------- | ----------------------------------------------------------------------------- |
+   | SDK `_row_id` 列 | `Int64`（Arrow）/ `i64`（Rust） | Iceberg 元数据列定义即 `BIGINT` → 对应 `Int64`                                         |
+   | BTree 插件        | `i64`                       | 直接读写 Arrow `Int64Array`，零序列化开销                                                |
+   | IVF / IVF-PQ 插件 | `u64`                       | 二进制 LE 格式 `write_u64_le` / `read_u64_le`，与 Arrow 类型无关                         |
+   | `RowIdMapping`  | `u64`                       | `Range { first, count }` 中 `first + count` 可能超 `i64::MAX`（≥92 亿亿行），需 `u64` 保护 |
+   
+   **转换点**：BTree 搜索返回 `Int64Array` → 在 runtime 层 `as u64` 转为 `ScoredRowId { row_id: u64 }`；构建时 BTree 从 `Int64Array` 读 `i64` → 写索引存为 `i64`。IVF 构建时 `Int64Array` 读 `i64` → `as u64` 写二进制。所有转换在小端平台零开销。
+
 3. **元数据列天然隔离** —— 回表只投影数据列，`_row_id`/`_pos`/`_file` 上层不感知。
+
 4. **`_file` / `_pos` / `_row_id` 是 SDK 原生列** —— 硬编码常量，不通过 JSON 参数配置。
+
 5. **Bridge 是薄转发层** —— 不感知 `_row_id`，纯转发给 Index SDK。
+
 6. **双读优先级** —— 物理 `_row_id` 列 > 动态计算（见 §5.4）。
+
 7. **映射按快照自包含** —— per-snapshot，跨快照不共享。
 
 ### 7.1 RowIdMapping 的加载与缓存模型（无淘汰）
@@ -711,7 +789,7 @@ open_metadata_location(config)
 | INSERT 增量                   | ✅          | `maintain_index(AppendOnly)` + `plan_incremental`                                                                                                                                                       |
 | **端到端 DML 维护编排**            | ⚠️ **未接通** | `prune`/`remove_row_ids`/`rebuild_after_compaction`/`maintain_index(DeleteOnly/Compaction)` 是积木，框架已实现但 **ABI 层未暴露**对应入口（当前 ABI 只有 `build/optimize/drop_index_by_metadata`），引擎无法通过 ABI 调用；`prune` 无生产调用方 |
 | **prune 后注册表统计刷新**          | ⚠️ 未接通     | 段重写后 `indexed_rows`/`size_bytes` 应刷新，编排未接                                                                                                                                                               |
-| **映射持久化（注册表提交路径）** | ⚠️ 未接入 | `write_registry_statistics_file` 已支持携带映射 blob，但 `IndexedTableView` 的 `prepare_registry_with` 未将持有的 `self.mapping` 传入，下次打开表时靠 `build_rowid_mapping` 从数据文件重建而非直接读 blob。ABI 无需感知此改动 |                                                                                                                               |
+| **映射持久化（注册表提交路径）**          | ✅ 完成       | `prepare_registry_with` / `prepare_drop_index` 将 `self.mapping` 传给 `prepare_registry_commit` → `write_registry_statistics_file`，映射 blob 随 registry Puffin 一并持久化。`open_metadata_location` 优先从 blob 恢复，缺失时回退重建。ABI 无需感知此改动 |
 | **prune 写新 URI**            | ❌ 未做       | 当前同 URI 覆盖，波及旧快照                                                                                                                                                                                        |
 | **映射分片惰性加载**                | ❌ 未做       | 全量常驻，超大表无背压                                                                                                                                                                                             |
 
